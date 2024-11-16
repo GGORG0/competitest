@@ -37,6 +37,7 @@ impl Test {
             let mut child = Command::new(command)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
                 .kill_on_drop(true)
                 .spawn()?;
 
