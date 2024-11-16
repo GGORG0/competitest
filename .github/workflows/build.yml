@@ -24,6 +24,7 @@ jobs:
         id: compile
         uses: rust-build/rust-build.action@v1.4.5
         with:
+          TOOLCHAIN_VERSION: stable
           RUSTTARGET: ${{ matrix.target }}
           ARCHIVE_TYPES: ${{ matrix.archive }}
           UPLOAD_MODE: none
