@@ -8,12 +8,12 @@ use clap::Parser;
 use color_eyre::Result;
 use env_logger::fmt::style::{AnsiColor, Style};
 use futures::stream::{FuturesUnordered, StreamExt};
-use indicatif::{MultiProgress, ProgressBar};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use indicatif_log_bridge::LogWrapper;
 use log::{error, info};
 use std::io::Write;
 use tests::{get_tests, TestTimeoutResult};
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 
 #[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
@@ -67,45 +67,57 @@ impl TestStats {
 async fn main() -> Result<()> {
     color_eyre::install()?;
 
-    let logger = env_logger::builder()
-        .filter_level(log::LevelFilter::Info)
-        .format(|buf, record| {
-            let subtle = Style::new().fg_color(Some(AnsiColor::BrightBlack.into()));
-            let level_style = buf.default_level_style(record.level());
+    let logger =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+            .format(|buf, record| {
+                let subtle = Style::new().fg_color(Some(AnsiColor::BrightBlack.into()));
+                let level_style = buf.default_level_style(record.level());
 
-            writeln!(
-                buf,
-                "{subtle}[{subtle:#}{} {level_style}{:<5}{level_style:#}{subtle}]{subtle:#} {}",
-                Local::now().format("%d-%m-%Y %H:%M:%S"),
-                record.level(),
-                record.args()
-            )
-        })
-        .build();
+                writeln!(
+                    buf,
+                    "{subtle}[{subtle:#}{} {level_style}{:<5}{level_style:#}{subtle}]{subtle:#} {}",
+                    Local::now().format("%d-%m-%Y %H:%M:%S"),
+                    record.level(),
+                    record.args()
+                )
+            })
+            .build();
 
     let args = Args::parse();
 
     let tests = get_tests(&args)?;
+    let test_count = tests.len();
 
     let multi = MultiProgress::new();
     LogWrapper::new(multi.clone(), logger).try_init()?;
-    let progress_bar = multi.add(ProgressBar::new(tests.len().try_into()?));
+
+    let progress_bar = multi.add(ProgressBar::new(test_count.try_into()?));
+
+    progress_bar.set_style(
+        ProgressStyle::with_template(
+            "[{elapsed_precise}]▕{wide_bar}▏{pos}/{len} {percent}% ({msg}, {per_sec:!5} tests/s, ETA: {eta})",
+        )
+        .unwrap()
+        .progress_chars("█▉▊▋▌▍▎▏  "),
+    );
+    progress_bar.set_message("0 failed");
 
     let progress_bar = Arc::new(progress_bar);
+
+    let failed_tests = Arc::new(Mutex::new(0usize));
 
     let semaphore = Arc::new(Semaphore::new(args.parallel));
 
     info!(
         "Loaded {} tests for task {}. Running {} tests in parallel.",
-        tests.len(),
-        &args.task,
-        &args.parallel
+        test_count, &args.task, &args.parallel
     );
 
     let tests: FuturesUnordered<_> = tests
         .into_iter()
         .map(|test| {
             let progress_bar = progress_bar.clone();
+            let failed_tests = failed_tests.clone();
             let semaphore = semaphore.clone();
 
             let args = args.clone();
@@ -118,6 +130,21 @@ async fn main() -> Result<()> {
                 if let Err(e) = &ret {
                     error!("✖ Test {} - ERROR\n{:?}", name, e);
                 }
+
+                let incr_failed_tests = || async {
+                    let mut failed_tests = failed_tests.lock().await;
+                    *failed_tests += 1;
+                    progress_bar.set_message(format!("{} failed", *failed_tests));
+                };
+
+                if let Ok(TestTimeoutResult::Finished(x)) = &ret {
+                    if !x.correct {
+                        incr_failed_tests().await;
+                    }
+                } else {
+                    incr_failed_tests().await;
+                }
+
                 progress_bar.inc(1);
                 ret
             })
@@ -149,14 +176,15 @@ async fn main() -> Result<()> {
         }
     }
 
-    info!(
-        "*** TEST REPORT ***\n✔ PASS: {}\n✖ FAIL: {}\n✖ TIMEOUT: {}",
+    progress_bar.finish();
+
+    println!(
+        "*** TEST REPORT ***\n  TOTAL: {}\n✔ PASS: {}\n✖ FAIL: {}\n✖ TIMEOUT: {}",
+        test_count,
         stats.pass.len(),
         stats.fail.len(),
         stats.timeout.len()
     );
-
-    progress_bar.finish();
 
     Ok(())
 }
